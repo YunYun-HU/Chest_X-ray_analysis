@@ -1,13 +1,13 @@
 from OpenFile import Readfile
 from Data_Cleaning import DataCleaning
-from CNN import CNNModel
 from GA import GeneticOptimizer
+from DenseNet import DenseNet
+from Evaluate import evaluate
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
-
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 print(device)
 
@@ -17,15 +17,19 @@ def main():
     csv_path = loader.read_csv()
     png_path = loader.read_png()
 
-    #data cleaning
-    cleaner = DataCleaning(csv_path, png_path, input_size=224)
-    df  = cleaner.clean_cxr8_csv()
+    #保留疾病
+    DISEASES = [
+        "Infiltration",
+        "Effusion"
+        ]
 
+    #data cleaning
+    cleaner = DataCleaning(csv_path, png_path, input_size=224, DISEASES=DISEASES)
+    df  = cleaner.clean_cxr8_csv()
+    print(df.head())
     #切分
     picture_train, picture_val, picture_test, lab_train, lab_val, lab_test = cleaner.split_data(df)
 
-    print(df[cleaner.DISEASES].sum())    
-    
     #ga
     ga = GeneticOptimizer(
         input_size=224,
@@ -35,7 +39,7 @@ def main():
         picture_val=picture_val,
         lab_val=lab_val,
         pop_size=8,
-        generations=4,
+        generations=1,
         elite_size=2,
         mutation_rate=0.2
     )
@@ -48,13 +52,20 @@ def main():
 
 
     #用最佳參數建立最終模型
-    model = CNNModel(
+    model = DenseNet(
         input_size=224,
         num_classes=len(cleaner.DISEASES),
-        base_filters=best_params["base_filters"],
         dense_units=best_params["dense_units"],
         dropout_rate=best_params["dropout_rate"]
     ).to(device)
+
+    pos_counts = lab_train.sum(dim=0)
+    neg_counts = len(lab_train) - pos_counts
+    pos_weight = neg_counts / (pos_counts + 1e-8)
+
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+
+    print("pos_weight =", pos_weight)
 
     criterion = nn.BCEWithLogitsLoss()
     
@@ -116,27 +127,16 @@ def main():
 
         print(f"Epoch {epoch+1}/{epochs}, val_auc={val_auc:.4f}")
 
+    
+    #評估資料
+    evaluator = evaluate(
+    model=model,
+    test_loader=test_loader,
+    threshold=[0.1, 0.1],
+    DISEASES=DISEASES
+    )
 
-    #test評估
-    model.eval()
-    test_preds = []
-    test_trues = []
-
-    with torch.no_grad():
-        for x, y in test_loader:
-            x = x.to(device)
-            output = model(x)
-            prob = torch.sigmoid(output).cpu()
-
-            test_preds.append(prob)
-            test_trues.append(y)
-
-    test_preds = torch.cat(test_preds).numpy()
-    test_trues = torch.cat(test_trues).numpy()
-    test_auc = roc_auc_score(test_trues, test_preds, average="macro")
-
-    print("Test AUC:", test_auc)
-
+    evaluator.evaluate()
 
 if __name__ == "__main__":
     main()

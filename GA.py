@@ -1,15 +1,21 @@
 import random
-from CNN import CNNModel
+#from CNN import CNNModel
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
+from DenseNet import DenseNet
 #chromosome
-BASE_FILTERS_CHOICES = [16, 32, 64]
+BASE_FILTERS_CHOICES = [64] 
+DENSE_UNITS_CHOICES  = [256]
+DROPOUT_CHOICES      = [0.2]
+LR_CHOICES           = [1e-4]
+BATCH_SIZE_CHOICES   = [32]
+"""BASE_FILTERS_CHOICES = [16, 32, 64] 
 DENSE_UNITS_CHOICES  = [128, 256, 512]
 DROPOUT_CHOICES      = [0.2, 0.3, 0.4, 0.5]
 LR_CHOICES           = [1e-4, 3e-4, 1e-3]
-BATCH_SIZE_CHOICES   = [8, 16, 32]
+BATCH_SIZE_CHOICES   = [8, 16, 32]"""
 
 class GeneticOptimizer:
     #代數，族群數，精英數，突變率
@@ -40,7 +46,6 @@ class GeneticOptimizer:
     #染色體解碼成參數 like "base_filters": 32,
     def decode(self, chromosome):
         return {
-            "base_filters": BASE_FILTERS_CHOICES[chromosome[0]],
             "dense_units": DENSE_UNITS_CHOICES[chromosome[1]],
             "dropout_rate": DROPOUT_CHOICES[chromosome[2]],
             "lr": LR_CHOICES[chromosome[3]],
@@ -53,10 +58,9 @@ class GeneticOptimizer:
         params = self.decode(chromosome)
 
         #呼叫cnn
-        model = CNNModel(
+        model = DenseNet(
         self.input_size,
         self.num_classes,
-        base_filters=params["base_filters"],
         dense_units=params["dense_units"],
         dropout_rate=params["dropout_rate"]
         ).to(device)
