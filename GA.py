@@ -1,198 +1,237 @@
-import random
-#from CNN import CNNModel
+import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import roc_auc_score
-from DenseNet import DenseNet
-#chromosome
-BASE_FILTERS_CHOICES = [64] 
-DENSE_UNITS_CHOICES  = [256]
-DROPOUT_CHOICES      = [0.2]
-LR_CHOICES           = [1e-4]
-BATCH_SIZE_CHOICES   = [32]
-"""BASE_FILTERS_CHOICES = [16, 32, 64] 
-DENSE_UNITS_CHOICES  = [128, 256, 512]
-DROPOUT_CHOICES      = [0.2, 0.3, 0.4, 0.5]
-LR_CHOICES           = [1e-4, 3e-4, 1e-3]
-BATCH_SIZE_CHOICES   = [8, 16, 32]"""
 
-class GeneticOptimizer:
-    #代數，族群數，精英數，突變率
-    def __init__(self, input_size, num_classes, picture_train, lab_train, picture_val, lab_val,
-                 pop_size=8, generations=5, elite_size=2, mutation_rate=0.2):
-        self.input_size = input_size
+from sklearn.metrics import f1_score, recall_score, precision_score
+
+
+class GAThresholdOptimizer:
+    def __init__(
+        self,
+        model,
+        val_loader,
+        device,
+        num_classes,
+        population_size=30,
+        generations=50,
+        elite_size=2,
+        mutation_rate=0.2,
+        crossover_rate=0.8,
+        threshold_min=0.05,
+        threshold_max=0.95,
+        fitness_mode="f1"
+    ):
+        self.model = model
+        self.val_loader = val_loader
+        self.device = device
         self.num_classes = num_classes
-        self.picture_train = picture_train
-        self.lab_train = lab_train
-        self.picture_val = picture_val
-        self.lab_val = lab_val
 
-        self.pop_size = pop_size
+        self.population_size = population_size
         self.generations = generations
         self.elite_size = elite_size
         self.mutation_rate = mutation_rate
+        self.crossover_rate = crossover_rate
 
-    #隨機產生一條染色體
-    def random_chromosome(self):
-        return [
-            random.randint(0, len(BASE_FILTERS_CHOICES)-1),
-            random.randint(0, len(DENSE_UNITS_CHOICES)-1),
-            random.randint(0, len(DROPOUT_CHOICES)-1),
-            random.randint(0, len(LR_CHOICES)-1),
-            random.randint(0, len(BATCH_SIZE_CHOICES)-1),
-        ]
+        self.threshold_min = threshold_min
+        self.threshold_max = threshold_max
 
-    #染色體解碼成參數 like "base_filters": 32,
-    def decode(self, chromosome):
-        return {
-            "dense_units": DENSE_UNITS_CHOICES[chromosome[1]],
-            "dropout_rate": DROPOUT_CHOICES[chromosome[2]],
-            "lr": LR_CHOICES[chromosome[3]],
-            "batch_size": BATCH_SIZE_CHOICES[chromosome[4]],
-        }
+        self.fitness_mode = fitness_mode
 
-    #計算染色體分數
-    def fitness(self, chromosome):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        params = self.decode(chromosome)
 
-        #呼叫cnn
-        model = DenseNet(
-        self.input_size,
-        self.num_classes,
-        dense_units=params["dense_units"],
-        dropout_rate=params["dropout_rate"]
-        ).to(device)
+    # 收集 validation set 的預測機率與真實標籤
+    def collect_val_outputs(self):
+        self.model.eval()
 
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
-
-        train_ds = TensorDataset(self.picture_train, self.lab_train)
-        val_ds   = TensorDataset(self.picture_val, self.lab_val)
-
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=params["batch_size"],
-            shuffle=True
-        )
-
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=params["batch_size"],
-            shuffle=False
-        )
-
-        # train
-        model.train()
-        for epoch in range(2):   # GA 階段先少跑
-            for x, y in train_loader:
-                x = x.to(device)
-                y = y.to(device)
-
-                optimizer.zero_grad()
-                output = model(x)
-                loss = criterion(output, y)
-                loss.backward()
-                optimizer.step()
-
-        # validation
-        model.eval()
-        preds = []
-        trues = []
+        all_probs = []
+        all_labels = []
 
         with torch.no_grad():
-            for x, y in val_loader:
-                x = x.to(device)
+            for batch in self.val_loader:
 
-                output = model(x)
-                prob = torch.sigmoid(output).cpu()
+                # 你的 main 裡面 dataset 回傳的是 x, y, sample_weight
+                if len(batch) == 3:
+                    x, y, _ = batch
+                else:
+                    x, y = batch
 
-                preds.append(prob)
-                trues.append(y)
+                x = x.to(self.device)
+                y = y.to(self.device)
 
-        preds = torch.cat(preds).numpy()
-        trues = torch.cat(trues).numpy()
+                output = self.model(x)
+                prob = torch.sigmoid(output)
 
-        score = roc_auc_score(trues, preds, average="macro")
+                all_probs.append(prob.cpu().numpy())
+                all_labels.append(y.cpu().numpy())
+
+        all_probs = np.vstack(all_probs)
+        all_labels = np.vstack(all_labels)
+
+        return all_probs, all_labels
+
+
+    # 初始化族群
+    # 每一條 chromosome 都是一組 threshold
+    def initialize_population(self):
+        population = np.random.uniform(
+            low=self.threshold_min,
+            high=self.threshold_max,
+            size=(self.population_size, self.num_classes)
+        )
+
+        return population
+
+
+    # fitness function
+    def fitness(self, chromosome, y_true, y_prob):
+        y_pred = (y_prob >= chromosome).astype(int)
+
+        macro_f1 = f1_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        )
+
+        macro_recall = recall_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        )
+
+        macro_precision = precision_score(
+            y_true,
+            y_pred,
+            average="macro",
+            zero_division=0
+        )
+
+        if self.fitness_mode == "f1":
+            score = macro_f1
+
+        elif self.fitness_mode == "medical":
+            # 醫療影像通常比較重視不要漏診
+            # 所以 recall 權重稍微提高
+            score = (
+                0.5 * macro_f1 +
+                0.3 * macro_recall +
+                0.2 * macro_precision
+            )
+
+        elif self.fitness_mode == "recall":
+            score = macro_recall
+
+        else:
+            score = macro_f1
 
         return score
 
-    #選擇父母
-    def select_parents(self, population, scores):
 
-        # tournament selection
-        selected = []
-        for _ in range(2):
-            idxs = random.sample(range(len(population)), 3)
-            best_idx = max(idxs, key=lambda i: scores[i])
-            selected.append(population[best_idx])
-        return selected
+    # selection：錦標賽選擇
+    def selection(self, population, fitness_scores):
+        tournament_size = 3
 
-    #交配
-    def crossover(self, p1, p2):
-        point = random.randint(1, len(p1)-1)
-        c1 = p1[:point] + p2[point:]
-        c2 = p2[:point] + p1[point:]
-        return c1, c2
+        selected_indices = np.random.choice(
+            len(population),
+            size=tournament_size,
+            replace=False
+        )
 
-    #突變
+        selected_fitness = fitness_scores[selected_indices]
+        best_index = selected_indices[np.argmax(selected_fitness)]
+
+        return population[best_index].copy()
+
+
+    # crossover：均勻交配
+    def crossover(self, parent1, parent2):
+        if np.random.rand() > self.crossover_rate:
+            return parent1.copy(), parent2.copy()
+
+        mask = np.random.rand(self.num_classes) < 0.5
+
+        child1 = parent1.copy()
+        child2 = parent2.copy()
+
+        child1[mask] = parent2[mask]
+        child2[mask] = parent1[mask]
+
+        return child1, child2
+
+
+    # mutation：突變 threshold
     def mutate(self, chromosome):
-        for i in range(len(chromosome)):
-            if random.random() < self.mutation_rate:
-                if i == 0:
-                    chromosome[i] = random.randint(0, len(BASE_FILTERS_CHOICES)-1)
-                elif i == 1:
-                    chromosome[i] = random.randint(0, len(DENSE_UNITS_CHOICES)-1)
-                elif i == 2:
-                    chromosome[i] = random.randint(0, len(DROPOUT_CHOICES)-1)
-                elif i == 3:
-                    chromosome[i] = random.randint(0, len(LR_CHOICES)-1)
-                elif i == 4:
-                    chromosome[i] = random.randint(0, len(BATCH_SIZE_CHOICES)-1)
+        for i in range(self.num_classes):
+            if np.random.rand() < self.mutation_rate:
+                noise = np.random.normal(
+                    loc=0.0,
+                    scale=0.05
+                )
+
+                chromosome[i] += noise
+
+                chromosome[i] = np.clip(
+                    chromosome[i],
+                    self.threshold_min,
+                    self.threshold_max
+                )
+
         return chromosome
 
 
-    #執行
-    def run(self):
-        #初始化族群
-        population = [self.random_chromosome() for _ in range(self.pop_size)]
+    # GA 主流程
+    def optimize(self):
+        y_prob, y_true = self.collect_val_outputs()
 
-        #初始化最佳染色體
+        population = self.initialize_population()
+
         best_chromosome = None
         best_score = -1
 
-        #迭代
-        for gen in range(self.generations):
-            #計算分數
-            scores = [self.fitness(ch) for ch in population]
+        for generation in range(self.generations):
+            fitness_scores = np.array([
+                self.fitness(chromosome, y_true, y_prob)
+                for chromosome in population
+            ])
 
-            #依分數排序
-            ranked = sorted(zip(population, scores), key=lambda x: x[1], reverse=True)
-            population = [x[0] for x in ranked]
-            scores = [x[1] for x in ranked]
+            sorted_indices = np.argsort(fitness_scores)[::-1]
 
-            #更新最佳染色體
-            if scores[0] > best_score:
-                best_score = scores[0]
-                best_chromosome = population[0]
+            current_best_index = sorted_indices[0]
+            current_best_score = fitness_scores[current_best_index]
+            current_best_chromosome = population[current_best_index]
 
-            print(f"Generation {gen+1}: best_val_auc = {scores[0]:.4f}, best = {self.decode(population[0])}")
-            
-            #保留菁英
-            new_population = population[:self.elite_size]
+            if current_best_score > best_score:
+                best_score = current_best_score
+                best_chromosome = current_best_chromosome.copy()
 
-            #產生新族群 
-            while len(new_population) < self.pop_size:
-                p1, p2 = self.select_parents(population, scores)
-                c1, c2 = self.crossover(p1, p2)
-                c1 = self.mutate(c1)
-                c2 = self.mutate(c2)
-                new_population.append(c1)
-                if len(new_population) < self.pop_size:
-                    new_population.append(c2)
+            print(
+                f"[GA Threshold] Generation {generation + 1}/{self.generations} | "
+                f"Best Fitness = {best_score:.4f} | "
+                f"Threshold = {np.round(best_chromosome, 3)}"
+            )
 
-            #用新族群進入下一代
-            population = new_population
+            new_population = []
 
-        return best_chromosome, best_score, self.decode(best_chromosome)
+            # elite 保留
+            elites = population[sorted_indices[:self.elite_size]]
+
+            for elite in elites:
+                new_population.append(elite.copy())
+
+            # 產生下一代
+            while len(new_population) < self.population_size:
+                parent1 = self.selection(population, fitness_scores)
+                parent2 = self.selection(population, fitness_scores)
+
+                child1, child2 = self.crossover(parent1, parent2)
+
+                child1 = self.mutate(child1)
+                child2 = self.mutate(child2)
+
+                new_population.append(child1)
+
+                if len(new_population) < self.population_size:
+                    new_population.append(child2)
+
+            population = np.array(new_population)
+
+        return best_chromosome.tolist(), best_score

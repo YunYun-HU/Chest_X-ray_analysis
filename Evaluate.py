@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
-
 class evaluate:
     def __init__(self, model, test_loader, threshold=0.4, DISEASES=None):
         self.model = model.eval()
@@ -34,7 +33,7 @@ class evaluate:
 
         # test 評估
         with torch.no_grad():
-            for x, y in self.test_loader:
+            for x, y, _ in self.test_loader:
                 x = x.to(device)
 
                 output = self.model(x)
@@ -115,3 +114,5 @@ class evaluate:
             print("  F1        :", round(f1, 4))
             print("  Recall    :", round(rec, 4))
             print("  Precision :", round(prec, 4))
+
+
