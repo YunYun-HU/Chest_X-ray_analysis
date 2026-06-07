@@ -10,12 +10,17 @@ class OpenFile:
         self.CXR8_DIR = self.PROJECT_DIR / "CXR8"
 
         self.csv_path_ins = self.CXR8_DIR / "Data_Entry_2017_v2020.csv"
+        self.lung_csv_path = self.CXR8_DIR / "ChestX-Ray8.csv"
         self.img_dir = self.CXR8_DIR / "images"
         self.number = number
 
     # 讀取原始 CSV
     def read_csv(self):
         return self.csv_path_ins
+
+    # 讀取肺野切割 CSV
+    def read_lung_csv(self):
+        return self.lung_csv_path
 
     # 讀取 png，回傳相對於 CXR8 的路徑
     def read_png(self):

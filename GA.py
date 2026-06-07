@@ -79,11 +79,19 @@ class GAThresholdOptimizer:
 
         return population
 
-
     # fitness function
     def fitness(self, chromosome, y_true, y_prob):
         y_pred = (y_prob >= chromosome).astype(int)
 
+        # 每一類的 F1
+        per_class_f1 = f1_score(
+            y_true,
+            y_pred,
+            average=None,
+            zero_division=0
+        )
+
+        # macro 指標
         macro_f1 = f1_score(
             y_true,
             y_pred,
@@ -105,26 +113,34 @@ class GAThresholdOptimizer:
             zero_division=0
         )
 
-        if self.fitness_mode == "f1":
-            score = macro_f1
+        # 少數類別加權
+        # pos_count 越少，權重越高
+        # 用 sqrt 避免少數類別權重過度放大
+        pos_count = y_true.sum(axis=0)
+        class_weight = 1.0 / np.sqrt(pos_count + 1e-6)
+        class_weight = class_weight / class_weight.sum()
 
-        elif self.fitness_mode == "medical":
-            # 醫療影像通常比較重視不要漏診
-            # 所以 recall 權重稍微提高
-            score = (
-                0.5 * macro_f1 +
-                0.3 * macro_recall +
-                0.2 * macro_precision
-            )
+        weighted_f1 = np.sum(class_weight * per_class_f1)
 
-        elif self.fitness_mode == "recall":
-            score = macro_recall
+        # F1 為主，兼顧少數類別、Recall、Precision
+        score = (
+            0.50 * macro_f1 +
+            0.20 * weighted_f1 +
+            0.20 * macro_recall +
+            0.10 * macro_precision
+        )
 
-        else:
-            score = macro_f1
+        # 防止 threshold 太低導致 Precision 崩掉
+        precision_floor = 0.58
+        recall_floor = 0.68
+
+        if macro_precision < precision_floor:
+            score -= 0.35 * (precision_floor - macro_precision)
+
+        if macro_recall < recall_floor:
+            score -= 0.20 * (recall_floor - macro_recall)
 
         return score
-
 
     # selection：錦標賽選擇
     def selection(self, population, fitness_scores):

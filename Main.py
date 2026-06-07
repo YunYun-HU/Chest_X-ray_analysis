@@ -4,6 +4,7 @@ from GA import GAThresholdOptimizer
 from DenseNet import DenseNet, EarlyStopping
 from Evaluate import evaluate
 from GradCAM import GradCAM, show_gradcam
+from loss import BCEFZLPRLoss
 
 import torch
 import torch.nn as nn
@@ -12,9 +13,9 @@ from pathlib import Path
 
 def main():
     #--------------------------------基本設定---------------------------------
-    
+
     #第幾個訓練集
-    number = 3
+    number = 4
 
     #--------------------------------超參數---------------------------------
     #輸入大小
@@ -33,18 +34,33 @@ def main():
     #CPU加速讀資料
     num_workers = 6
 
-    #超過多少判斷有病
-    threshold = [0.4, 0.35, 0.81, 0.74]                      #[0.5, 0.5, 0.7, 0.5, 0.7, 0.55, 0.7]    Effusion Atelectasis Cardiomegaly Pneumothorax  Edema
-                                                                        # Nodule Emphysema 
-    
+    #超過多少判斷有病,但只是初值後面會丟入ga算
+    threshold = [0.4, 0.35, 0.81, 0.74]                      
+                                                                        
+
     #使否使用ga
     use_ga = True
-    
+
     #是否使用elvaluate評估
     use_evaluate = True
-    
+
     #使用已經訓練好的 DenseNet 權重。
     pretrained = True
+
+    #是否使用肺野切割 mask，只保留 Left Lung + Right Lung
+    use_lung_mask = True
+
+    #是否將 lung mask 當成第二通道輸入
+    #True：輸入 shape = [batch, 2, H, W]，第1通道原圖，第2通道肺野mask
+    #False：輸入 shape = [batch, 1, H, W]，使用 soft mask 或原圖
+    mask_as_channel = True
+
+    #只有 mask_as_channel=False 時，這個值才會影響 soft mask
+    #肺內保留100%，肺外保留 mask_outside_value
+    mask_outside_value = 0.15
+
+    #DenseNet 輸入通道數
+    input_channels = 2 if mask_as_channel else 1
 
     #早停
     early_stopping = EarlyStopping(
@@ -53,16 +69,16 @@ def main():
     )
 
     #-----------------------------資料集疾病標籤---------------------------------
- 
+
     #保留疾病
     DISEASES = [
         "Effusion",
         "Atelectasis",
         "Cardiomegaly",
         "Emphysema"
-        ]
-    
-    
+    ]
+
+
     num_classes = len(DISEASES)
 
     #-----------------------------路徑設定---------------------------------
@@ -86,7 +102,7 @@ def main():
 
     loader = OpenFile(number)
     if csv_file.exists():
-        
+
         print("檔案已存在，直接讀取")
         train_set = loader.read_train_df()
         val_set   = loader.read_val_df()    
@@ -99,9 +115,17 @@ def main():
         #openfile
         csv_path = loader.read_csv()
         png_path = loader.read_png()
+        lung_csv_path = loader.read_lung_csv()
 
         #data cleaning
-        cleaner = DataCleaning(csv_path, png_path, input_size=224, DISEASES=DISEASES)
+        cleaner = DataCleaning(
+            csv_path,
+            png_path,
+            input_size=224,
+            DISEASES=DISEASES,
+            lung_csv_path=lung_csv_path,
+            min_dice_mean=0.7
+        )
         df = cleaner.clean_cxr8_csv()
 
         df = loader.new_file(df, len(DISEASES))
@@ -131,7 +155,10 @@ def main():
         data_root=CXR8_DIR,
         diseases=DISEASES,
         input_size=input_size,
-        mode="train"
+        mode="train",
+        use_lung_mask=use_lung_mask,
+        mask_outside_value=mask_outside_value,
+        mask_as_channel=mask_as_channel
     )
 
     val_dataset = DataForDenseNet(
@@ -139,7 +166,10 @@ def main():
         data_root=CXR8_DIR,
         diseases=DISEASES,
         input_size=input_size,
-        mode="eval"
+        mode="eval",
+        use_lung_mask=use_lung_mask,
+        mask_outside_value=mask_outside_value,
+        mask_as_channel=mask_as_channel
     )
 
     test_dataset = DataForDenseNet(
@@ -147,7 +177,10 @@ def main():
         data_root=CXR8_DIR,
         diseases=DISEASES,
         input_size=input_size,
-        mode="eval"
+        mode="eval",
+        use_lung_mask=use_lung_mask,
+        mask_outside_value=mask_outside_value,
+        mask_as_channel=mask_as_channel
     )
 
     #DataLoader 是pytorch資料批次讀取器
@@ -179,28 +212,29 @@ def main():
         num_classes=num_classes,
         dense_units=dense_units,
         dropout_rate=dropout_rate,
-        pretrained=pretrained
+        pretrained=pretrained,
+        input_channels=input_channels
     ).to(device)
 
 
     #加入個別樣本權重的損失函數
-    train_labels = torch.stack([
-        train_dataset[i][1] for i in range(len(train_dataset))
-    ]).float()
+    train_labels = torch.tensor(
+        train_dataset.df[DISEASES].values.astype("float32")
+    )
 
-    labels = train_labels.float()   # shape: [N, 5]
+    labels = train_labels.float()   # shape: [N, num_classes]
 
     pos_count = labels.sum(dim=0)
     neg_count = labels.shape[0] - pos_count
 
     pos_weight = neg_count / (pos_count + 1e-6)
-    pos_weight = torch.clamp(pos_weight, max=3.0)
+    pos_weight = torch.clamp(pos_weight, max=3.5)
 
-    criterion = nn.BCEWithLogitsLoss(
-    pos_weight=pos_weight.to(device),
-    reduction="none"
+    criterion = BCEFZLPRLoss(
+        pos_weight=pos_weight.to(device),
+        alpha=0.7,
+        gamma=2.0
     )
-
 
     #criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)       
@@ -214,18 +248,15 @@ def main():
         total_loss = 0
 
         for x, y, sample_weight in train_loader:
-            x = x.to(device)  # x shape: [batch, 1, 224, 224]
-            y = y.to(device)  # y shape: [batch, 3]
+            x = x.to(device)  # x shape: [batch, input_channels, input_size, input_size]
+            y = y.to(device)  # y shape: [batch, num_classes]
             sample_weight = sample_weight.to(device) # shape: [batch]
 
             optimizer.zero_grad()
 
-            output = model(x)  # output shape: [batch, 3]
+            output = model(x)  # output shape: [batch, num_classes]
 
-
-            loss = criterion(output, y)
-            loss = loss * sample_weight.view(-1, 1)
-            loss = loss.mean()
+            loss = criterion(output, y, sample_weight)
 
             loss.backward()
             optimizer.step()
@@ -247,10 +278,7 @@ def main():
 
                 output = model(x)
 
-                loss = criterion(output, y)
-                loss = loss * sample_weight.view(-1, 1)
-                loss = loss.mean()
-                
+                loss = criterion(output, y, sample_weight)
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
@@ -291,7 +319,7 @@ def main():
         elite_size=4,
         mutation_rate=0.15,
         crossover_rate=0.8,
-        threshold_min=0.35,
+        threshold_min=0.1,
         threshold_max=0.9,
         fitness_mode="f1"
         )
@@ -315,12 +343,12 @@ def main():
 
 
     if use_evaluate:
-        
+
         print("grad-CAM輸入格式如下:什麼病徵判斷(number) (空格) test.csv圖片編號。")
         while True:
 
             #指定一種已學會的疾病判斷 在test.csv中指定一張圖片從零開始
-            class_idx, idx = input().split()  # 0=Cardiomegaly, 1=Effusion ...
+            class_idx, idx = input().split()  # 0=Effusion, 1=Atelectasis ...
 
             try:
                 class_idx = int(class_idx)
@@ -351,8 +379,12 @@ def main():
                 cam = gradcam.generate(x, class_idx=class_idx)
 
                 # 顯示
+                # 如果 mask_as_channel=True，image 是 [2, H, W]
+                # show_gradcam 只顯示第 1 channel，也就是原始 X-ray
+                show_image = image[0:1] if mask_as_channel else image
+
                 show_gradcam(
-                    image_tensor=image,
+                    image_tensor=show_image,
                     cam=cam,
                     title=f"Grad-CAM: {DISEASES[class_idx]}"
                 )
