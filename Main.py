@@ -53,11 +53,11 @@ def main():
     #是否將 lung mask 當成第二通道輸入
     #True：輸入 shape = [batch, 2, H, W]，第1通道原圖，第2通道肺野mask
     #False：輸入 shape = [batch, 1, H, W]，使用 soft mask 或原圖
-    mask_as_channel = True
+    mask_as_channel = False
 
     #只有 mask_as_channel=False 時，這個值才會影響 soft mask
     #肺內保留100%，肺外保留 mask_outside_value
-    mask_outside_value = 0.15
+    mask_outside_value = 0.60
 
     #DenseNet 輸入通道數
     input_channels = 2 if mask_as_channel else 1

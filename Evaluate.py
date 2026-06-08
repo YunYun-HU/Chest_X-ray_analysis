@@ -1,4 +1,4 @@
-import torch
+import torch 
 import numpy as np
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
@@ -114,5 +114,3 @@ class evaluate:
             print("  F1        :", round(f1, 4))
             print("  Recall    :", round(rec, 4))
             print("  Precision :", round(prec, 4))
-
-
